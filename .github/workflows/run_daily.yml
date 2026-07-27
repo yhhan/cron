@@ -1,0 +1,30 @@
+name: Daily Stock Data Collection
+
+on:
+  schedule:
+    # 한국 시간 21시 (21 - 9 = UTC 12시)
+    - cron: '0 12 * * *'
+  # 수동 실행 버튼 활성화
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 1. 파이썬 버전을 3.12.10으로 명시하여 설정
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Run Stock Collection Script
+      run: python collect_stock.py
