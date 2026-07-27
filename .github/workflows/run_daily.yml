@@ -29,4 +29,4 @@ jobs:
       env:
         # GitHub Secrets에 등록한 변수를 파이썬 os.environ으로 연결
         DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      run: python collect_stock.py
+      run: python -u collect_stock.py
