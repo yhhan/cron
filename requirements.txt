@@ -1,5 +1,6 @@
-python-dotenv>=1.1.0
-supabase>=2.0.0
-python-dateutil>=2.8.2
-pandas>=2.0.0
-finance-datareader>=0.9.202
+pandas
+finance-datareader
+sqlalchemy
+python-dateutil
+python-dotenv
+psycopg2-binary
