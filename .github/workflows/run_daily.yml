@@ -12,11 +12,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. 최신 Node.js 24와 호환되는 버전으로 업그레이드
     - name: Checkout code
       uses: actions/checkout@v5
 
-    # 2. 파이썬 설정 액션도 최신 호환 버전으로 업그레이드
     - name: Set up Python
       uses: actions/setup-python@v6
       with:
@@ -28,4 +26,7 @@ jobs:
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
     - name: Run Stock Collection Script
+      env:
+        # GitHub Secrets에 등록한 변수를 파이썬 os.environ으로 연결
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
       run: python collect_stock.py
