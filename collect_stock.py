@@ -3,6 +3,7 @@ from dateutil.relativedelta import relativedelta
 import pandas as pd
 import FinanceDataReader as fdr
 from sqlalchemy import create_engine, text
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import os
 
@@ -87,15 +88,16 @@ def init_database():
     
     return target_engine
 
-def get_last_date_for_ticker(engine, ticker):
-    """해당 ticker의 DB 마지막 수집일을 조회합니다. 없으면 None 반환."""
+def get_last_dates_for_all_tickers(engine, tickers):
+    """모든 ticker의 마지막 수집일을 한 번에 조회하여 dict로 반환합니다."""
+    if not tickers:
+        return {}
     with engine.connect() as conn:
         result = conn.execute(
-            text("SELECT MAX(date) FROM daily_prices WHERE ticker = :ticker"),
-            {"ticker": ticker}
+            text("SELECT ticker, MAX(date) FROM daily_prices WHERE ticker = ANY(:tickers) GROUP BY ticker"),
+            {"tickers": list(tickers)}
         )
-        row = result.fetchone()
-        return row[0] if row and row[0] else None
+        return {row[0]: row[1] for row in result.fetchall()}
 
 def is_db_empty(engine):
     """daily_prices 테이블에 데이터가 하나도 없는지 확인합니다."""
@@ -107,143 +109,147 @@ def collect_incremental_data(engine, end_date, tickers):
     """
     증분 수집: 각 ticker별로 DB에 마지막으로 저장된 날짜 이후의 데이터만 수집합니다.
     오늘 데이터가 이미 있으면 건너뜁니다.
-    메모리 사용량 최소화를 위해 종목별 개별 처리.
+    마지막 수집일을 한 번에 조회하고, API 호출은 병렬로 처리합니다.
     """
     total_inserted_rows = 0
     skipped_count = 0
-    duplicate_count = 0
+    total_processed = 0
     chunk_size = 50  # 진행 상황 표시 빈도 조정
 
-    for idx, ticker in enumerate(tickers):
-        last_date = get_last_date_for_ticker(engine, ticker)
+    # 한 번에 모든 ticker의 마지막 날짜 조회 (DB 쿼리 1회)
+    last_date_map = get_last_dates_for_all_tickers(engine, tickers)
 
-        # 오늘 데이터가 이미 있으면 건너뜀
-        if last_date and last_date >= datetime.date.today():
+    # 수집이 필요한 종목만 필터링
+    today = datetime.date.today()
+    tickers_to_fetch = []
+    for ticker in tickers:
+        last_date = last_date_map.get(ticker)
+        if last_date and last_date >= today:
             skipped_count += 1
-            if (idx + 1) % chunk_size == 0 or (idx + 1) == len(tickers):
-                print(f" [진행] {idx + 1}/{len(tickers)} 완료 (누적 {total_inserted_rows}건 적재, 건너뛴 종목: {skipped_count}, 중복: {duplicate_count})")
-            continue
-
-        # 시작일 결정: DB에 데이터가 있으면 마지막 날짜의 다음날, 없으면 6개월 전
-        if last_date:
-            ticker_start_date = (last_date + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
         else:
-            six_months_ago = datetime.date.today() - relativedelta(months=6)
-            ticker_start_date = six_months_ago.strftime('%Y-%m-%d')
+            tickers_to_fetch.append(ticker)
 
-        # 재시트 로직: SSL/Network 에러 시 최대 3회 재시도
-        df_price = None
+    print(f" [수집] 전체 {len(tickers)}종목 중 {len(tickers_to_fetch)}종목 수집 필요, {skipped_count}종목 건너뜀")
+
+    # 각 ticker별 시작일 계산
+    ticker_start_dates = {}
+    for ticker in tickers_to_fetch:
+        last_date = last_date_map.get(ticker)
+        if last_date:
+            ticker_start_dates[ticker] = (last_date + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            ticker_start_dates[ticker] = (today - relativedelta(months=6)).strftime('%Y-%m-%d')
+
+    def fetch_ticker_data(ticker):
+        """단일 ticker 데이터 조회 (재시도 로직 포함)"""
+        start_date = ticker_start_dates[ticker]
         for retry in range(3):
             try:
-                df_price = fdr.DataReader(ticker, start=ticker_start_date, end=end_date)
-                break
+                df = fdr.DataReader(ticker, start=start_date, end=end_date)
+                return ticker, df, None
             except Exception as e:
                 print(f" [재시도 {retry+1}/3] {ticker} 데이터 수집 실패: {e}")
                 if retry < 2:
                     time.sleep(2)
+        return ticker, None, f"Failed after 3 retries"
+
+    # 병렬 API 호출 (max_workers=5로 Rate Limit 방지)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fetch_ticker_data, ticker): ticker for ticker in tickers_to_fetch}
+
+        for future in as_completed(futures):
+            ticker, df, error = future.result()
+            total_processed += 1
+
+            if error or df is None or df.empty:
+                print(f"  [{ticker}] 데이터 없음 또는 수집 실패")
                 continue
 
-        if df_price is None or df_price.empty:
-            continue
+            df = df.reset_index()
+            df['ticker'] = ticker
+            df = df[['ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+            df.columns = ['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']
 
-        df_price = df_price.reset_index()
-        df_price['ticker'] = ticker
-        df_price = df_price[['ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df_price.columns = ['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']
-
-        # 개별 종목 즉시 저장 (메모리 누적 방지, bulk insert 사용)
-        try:
-            # to_sql을 사용한 bulk insert로 성능 개선
-            df_price.to_sql(
-                'daily_prices',
-                con=engine,
-                if_exists='append',
-                index=False,
-                method='multi',
-                chunksize=100
-            )
-            # 실제로 삽입된 행 수를 확인하기 위해 DB에서 카운트
-            with engine.connect() as conn:
-                result = conn.execute(
-                    text("SELECT COUNT(*) FROM daily_prices WHERE ticker = :ticker AND date >= :start_date"),
-                    {"ticker": ticker, "start_date": ticker_start_date}
+            try:
+                df.to_sql(
+                    'daily_prices',
+                    con=engine,
+                    if_exists='append',
+                    index=False,
+                    method='multi',
+                    chunksize=100
                 )
-                db_count = result.fetchone()[0]
-            
-            # 중복 데이터 수 계산
-            duplicate_rows = len(df_price) - db_count
-            if duplicate_rows > 0:
-                duplicate_count += duplicate_rows
-            total_inserted_rows += db_count
-            
-            print(f"  [{ticker}] {len(df_price)}건 시도, {db_count}건 삽입 (중복 {duplicate_rows}건)")
-        except Exception as db_err:
-            print(f" [DB 오류] {ticker} 저장 실패: {db_err}")
+                total_inserted_rows += len(df)
+                print(f"  [{ticker}] {len(df)}건 삽입 완료")
+            except Exception as db_err:
+                print(f" [DB 오류] {ticker} 저장 실패: {db_err}")
 
-        # 메모리 해제
-        del df_price
+            del df
 
-        # API 과부하 방지를 위한 짧은 대기
-        time.sleep(0.05)
+            # 진행 상황 표시
+            if total_processed % chunk_size == 0 or total_processed == len(tickers_to_fetch):
+                print(f" [진행] {total_processed}/{len(tickers_to_fetch)} 완료 (누적 {total_inserted_rows}건 적재)")
 
-        if (idx + 1) % chunk_size == 0 or (idx + 1) == len(tickers):
-            print(f" [진행] {idx + 1}/{len(tickers)} 완료 (누적 {total_inserted_rows}건 적재, 건너뛴 종목: {skipped_count}, 중복: {duplicate_count})")
-
-    print(f" [완료] 총 {total_inserted_rows}건의 새 데이터가 DB에 추가되었습니다. (건너뛴 종목: {skipped_count}, 중복 데이터: {duplicate_count})")
+    print(f" [완료] 총 {total_inserted_rows}건의 새 데이터가 DB에 추가되었습니다. (건너뛴 종목: {skipped_count})")
 
 
 def collect_all_data(engine, start_date, end_date, tickers):
     """
     전체 수집: 최초 1회용. 6개월치 데이터를 한꺼번에 수집합니다.
-    메모리 사용량 최소화를 위해 종목별 개별 처리.
+    API 호출은 병렬로 처리하여 수집 시간을 단축합니다.
     """
     total_inserted_rows = 0
+    total_processed = 0
     chunk_size = 50  # 진행 상황 표시 빈도 조정
 
-    for idx, ticker in enumerate(tickers):
-        # 재시도 로직: SSL/Network 에러 시 최대 3회 재시도
-        df_price = None
+    def fetch_ticker_data(ticker):
+        """단일 ticker 데이터 조회 (재시도 로직 포함)"""
         for retry in range(3):
             try:
-                df_price = fdr.DataReader(ticker, start=start_date, end=end_date)
-                break
+                df = fdr.DataReader(ticker, start=start_date, end=end_date)
+                return ticker, df, None
             except Exception as e:
                 print(f" [재시도 {retry+1}/3] {ticker} 데이터 수집 실패: {e}")
                 if retry < 2:
                     time.sleep(2)
+        return ticker, None, f"Failed after 3 retries"
+
+    # 병렬 API 호출 (max_workers=5)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fetch_ticker_data, ticker): ticker for ticker in tickers}
+
+        for future in as_completed(futures):
+            ticker, df, error = future.result()
+            total_processed += 1
+
+            if error or df is None or df.empty:
+                print(f"  [{ticker}] 데이터 없음")
                 continue
 
-        if df_price is None or df_price.empty:
-            continue
+            df = df.reset_index()
+            df['ticker'] = ticker
+            df = df[['ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+            df.columns = ['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']
 
-        df_price = df_price.reset_index()
-        df_price['ticker'] = ticker
-        df_price = df_price[['ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df_price.columns = ['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']
+            try:
+                df.to_sql(
+                    'daily_prices',
+                    con=engine,
+                    if_exists='append',
+                    index=False,
+                    method='multi',
+                    chunksize=100
+                )
+                total_inserted_rows += len(df)
+                print(f"  [{ticker}] {len(df)}건 삽입 완료")
+            except Exception as db_err:
+                print(f" [DB 오류] {ticker} 저장 실패: {db_err}")
 
-        # 개별 종목 즉시 저장 (메모리 누적 방지)
-        try:
-            df_price.to_sql(
-                'daily_prices',
-                con=engine,
-                if_exists='append',
-                index=False,
-                method='multi',
-                chunksize=100
-            )
-            total_inserted_rows += len(df_price)
-            print(f"  [{ticker}] {len(df_price)}건 삽입 완료")
-        except Exception as db_err:
-            print(f" [DB 오류] {ticker} 저장 실패: {db_err}")
+            del df
 
-        # 메모리 해제
-        del df_price
-
-        # API 과부하 방지를 위한 짧은 대기
-        time.sleep(0.05)
-
-        if (idx + 1) % chunk_size == 0 or (idx + 1) == len(tickers):
-            print(f" [진행] {idx + 1}/{len(tickers)} 완료 (누적 {total_inserted_rows}건 적재)")
+            # 진행 상황 표시
+            if total_processed % chunk_size == 0 or total_processed == len(tickers):
+                print(f" [진행] {total_processed}/{len(tickers)} 완료 (누적 {total_inserted_rows}건 적재)")
 
     print(f" [완료] 전체 수집 프로세스 종료! 총 {total_inserted_rows}개의 일봉 데이터가 'stockdb'에 반영되었습니다.")
 
