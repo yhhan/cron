@@ -2,8 +2,8 @@ name: Daily Stock Data Collection
 
 on:
   schedule:
-    # 한국 시간 21시 (21 - 9 = UTC 12시)
-    - cron: '0 12 * * *'
+    # 한국 시간 20시 (20 - 9 = UTC 11)
+    - cron: '11 11 * * *'
   # 수동 실행 버튼 활성화
   workflow_dispatch:
 
