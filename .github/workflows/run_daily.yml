@@ -3,7 +3,7 @@ name: Daily Stock Data Collection
 on:
   schedule:
     # 한국 시간 15:30
-    - cron: '30 06 * * *'
+    - cron: '30 06 * * 1-5'
   # 수동 실행 버튼 활성화
   workflow_dispatch:
 
