@@ -316,6 +316,19 @@ def collect_market_data(engine, market_name, today, end_date):
     return stocks_master['ticker'].tolist()
 
 
+def _invalidate_dashboard_cache():
+    """대시보드 HTML 캐시 파일을 삭제합니다. (데이터 수집 완료 시 호출)"""
+    try:
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cache')
+        if os.path.exists(cache_dir):
+            for filename in os.listdir(cache_dir):
+                if filename.startswith('dashboard_') and filename.endswith('.html'):
+                    os.remove(os.path.join(cache_dir, filename))
+            print(" [캐시] 대시보드 HTML 캐시 무효화 완료.")
+    except Exception as e:
+        print(f" [캐시] 대시보드 캐시 무효화 실패: {e}")
+
+
 def collect_and_save_stock_data(engine, batch_size=None, offset=0):
     """
     DB 상태에 따라 최초 전체 수집 또는 증분 수집을 실행합니다.
@@ -346,12 +359,14 @@ def collect_and_save_stock_data(engine, batch_size=None, offset=0):
         six_months_ago = today - relativedelta(months=6)
         start_date = six_months_ago.strftime('%Y-%m-%d')
         collect_all_data(engine, start_date, end_date, tickers)
+        _invalidate_dashboard_cache()
         return {"mode": "full", "processed": len(tickers)}
     else:
         print(" [DB] 기존 데이터가 있습니다. 증분 수집을 진행합니다.")
         # 증분 수집 전 18개월 이상 지난 데이터 삭제
         delete_old_data(engine, retention_months=18)
         collect_incremental_data(engine, end_date, tickers)
+        _invalidate_dashboard_cache()
         return {"mode": "incremental", "processed": len(tickers)}
 
 if __name__ == "__main__":
